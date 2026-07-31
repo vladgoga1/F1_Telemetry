@@ -1,0 +1,30 @@
+# Claude Code local config (machine-specific, not project source)
+CLAUDE.md
+.claude/
+
+# FastF1 telemetry cache (large, regenerable from the API)
+f1_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml

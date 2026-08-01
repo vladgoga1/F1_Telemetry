@@ -1,5 +1,6 @@
 
 import os
+import warnings
 from datetime import datetime
 
 import fastf1
@@ -70,9 +71,22 @@ def _position_glitch_mask(tel, min_xy_step=1.5, min_distance_step=3.0):
 
     stuck = (xy_step_m < min_xy_step) & (dist_step > min_distance_step)
     resync_tail = implied_speed > MAX_PLAUSIBLE_SPEED_MPS
+    bad_step = stuck | resync_tail
 
     mask = np.zeros(len(tel), dtype=bool)
-    mask[1:] = stuck | resync_tail
+    mask[1:] = bad_step
+
+    # Row 0 has no earlier row within this lap to check it against, so a glitch
+    # already in progress at the very first sample was never flagged - the bad
+    # step (0->1) always blamed row 1 instead. Use row 2 as a tie-breaker: if
+    # skipping row 1 entirely (0->2) is STILL an impossible jump, row 1 was
+    # innocent and row 0 itself is the corrupted one - flag it instead.
+    if len(tel) >= 3 and bad_step[0]:
+        step02_m = np.hypot(x[2] - x[0], y[2] - y[0]) / XY_UNITS_PER_METRE
+        dt02 = t_sec[2] - t_sec[0]
+        if dt02 > 0 and step02_m / dt02 > MAX_PLAUSIBLE_SPEED_MPS:
+            mask[0] = True
+            mask[1] = False
     return mask
 
 
@@ -190,17 +204,48 @@ def get_stint_telemetry(year, race, session_type, driver, stint):
     return pd.concat(frames, ignore_index=True)
 
 
-@st.cache_data(show_spinner="Building track-limit corridor from every driver's fastest lap...", persist="disk")
-def get_track_limit_envelope(year, race, session_type, bin_size=TRACK_LIMIT_BIN_SIZE_M):
+FINISHED_STATUSES = {'Finished', 'Lapped'}  # everything else in session.results['Status']
+# (Retired, Accident, Disqualified, Did not start, ...) is a retirement for the position chart.
+
+
+@st.cache_data(show_spinner=False, persist="disk")
+def get_position_progression(year, race, session_type):
+    """Per-lap running position for every driver, plus each driver's actual starting
+    GRID position (from session.results - reflects any penalties/pit-lane starts,
+    not just qualifying classification) and finishing status. Only meaningful for
+    Race/Sprint sessions - Qualifying doesn't have a persistent running position.
+    """
+    session = get_session_data(year, race, session_type)
+    laps = session.laps[['Driver', 'LapNumber', 'Position']].dropna(subset=['Position']).copy()
+    laps['LapNumber'] = laps['LapNumber'].astype(int)
+    laps['Position'] = laps['Position'].astype(int)
+
+    results = session.results[['Abbreviation', 'GridPosition', 'Status']].copy()
+    results = results.rename(columns={'Abbreviation': 'Driver'})
+    results['GridPosition'] = pd.to_numeric(results['GridPosition'], errors='coerce')
+
+    return laps, results
+
+
+@st.cache_data(show_spinner="Building track-limit corridor...", persist="disk")
+def get_track_limit_envelope(year, race, session_type, bin_size=TRACK_LIMIT_BIN_SIZE_M, top_n=None):
     """Approximate legal-racing corridor: the min/max lateral offset (from the overall
-    fastest lap's line) covered by each driver's own fastest clean lap. This is NOT the
-    physical white-line/curb geometry FastF1 doesn't expose that - it's the spread of
-    racing lines actually used at racing pace, which is what we use as the "normal"
-    corridor to flag a driver running wider than the field on a given lap.
+    fastest lap's line) covered by clean fastest laps. This is NOT the physical white-
+    line/curb geometry FastF1 doesn't expose that - it's the spread of racing lines
+    actually used at racing pace, which is what we use as the "normal" corridor to flag
+    a driver running wider than the field on a given lap.
+
+    top_n: if set, only the N fastest of those clean laps (by lap time, not finishing
+    position - a driver can finish well on strategy with a slow lap) go into the
+    corridor, so it represents "how the quick laps actually used the track" rather than
+    being diluted by the whole field including cars managing tyres or running
+    defensively. None (default) uses every driver's fastest clean lap, as before.
     """
     session = get_session_data(year, race, session_type)
     clean_laps = session.laps.pick_wo_box().pick_quicklaps()
     fastest_per_driver = clean_laps.loc[clean_laps.groupby('Driver')['LapTime'].idxmin()]
+    if top_n is not None:
+        fastest_per_driver = fastest_per_driver.sort_values('LapTime').head(top_n)
 
     ref_lap = session.laps.pick_fastest()
     ref_tel = _drop_stuck_position_samples(ref_lap.get_telemetry().reset_index(drop=True))
@@ -245,36 +290,65 @@ def get_track_limit_envelope(year, race, session_type, bin_size=TRACK_LIMIT_BIN_
     driver_col = {drv: i for i, drv in enumerate(driver_list)}
     n_drivers = len(driver_list)
 
-    min_by_driver = np.full((len(bins), n_drivers), np.inf)
-    max_by_driver = np.full((len(bins), n_drivers), -np.inf)
+    if n_drivers == 0:
+        # No driver has a clean quicklap this session (wet/red-flagged/very short
+        # session) - return explicitly invalid rather than silently computing an
+        # all-NaN envelope, which would make every offset comparison downstream
+        # evaluate false and report a false-clean "zero violations" result.
+        return {
+            'bins': bins, 'cx': cx, 'cy': cy, 'nx': nx, 'ny': ny,
+            'min_off': np.full(len(bins), np.nan), 'max_off': np.full(len(bins), np.nan),
+            'bin_size': bin_size, 'driver_count': 0, 'valid': False,
+        }
+
+    # Interpolate each driver's own continuous offset profile onto the bin grid,
+    # rather than binning raw samples into the nearest 5m bucket. Checked against real
+    # data (2026 Austria): at racing speed, telemetry samples land ~7m apart on
+    # average and up to 90m apart on the fastest straights, so nearest-bin binning left
+    # roughly HALF of all bins with zero raw samples from any given driver. Those gaps
+    # used to be forward/back-filled from whichever bin did have data, which produced a
+    # visible step exactly at the fill boundary - the "spikes" on straights (and, with
+    # fewer bins covered per corner too, some in corners). Interpolating gives every
+    # bin a legitimate value with no fill-boundary artifacts, and needs no bin-count
+    # threshold to kick in - it's correct at any speed/bin size.
+    offset_by_driver = np.full((len(bins), n_drivers), np.nan)
 
     for _, lap in fastest_per_driver.iterlaps():
         tel = _drop_stuck_position_samples(lap.get_telemetry())
         px, py, pdist = tel['X'].to_numpy(), tel['Y'].to_numpy(), tel['Distance'].to_numpy()
-        idx = np.clip(np.round(pdist / bin_size).astype(int), 0, len(bins) - 1)
-        offset = (px - cx[idx]) * nx[idx] + (py - cy[idx]) * ny[idx]
+        order = np.argsort(pdist)
+        pdist_sorted, px_sorted, py_sorted = pdist[order], px[order], py[order]
+        idx = np.clip(np.round(pdist_sorted / bin_size).astype(int), 0, len(bins) - 1)
+        raw_offset = (px_sorted - cx[idx]) * nx[idx] + (py_sorted - cy[idx]) * ny[idx]
         col = driver_col[lap['Driver']]
-        np.minimum.at(min_by_driver[:, col], idx, offset)
-        np.maximum.at(max_by_driver[:, col], idx, offset)
-
-    min_by_driver[np.isinf(min_by_driver)] = np.nan
-    max_by_driver[np.isinf(max_by_driver)] = np.nan
+        # np.interp clips to the boundary value outside pdist's own range (e.g. if this
+        # driver's lap measured slightly shorter/longer than the reference lap), rather
+        # than extrapolating wildly - a safe, bounded fallback for that edge.
+        offset_by_driver[:, col] = np.interp(bins, pdist_sorted, raw_offset)
 
     # Trim roughly the single widest driver on each side per bin (a percentile scaled
     # to the field size) instead of taking the absolute extreme, so the corridor
     # reflects the field's normal spread rather than one outlier lap.
     trim_pct = 100.0 / n_drivers if n_drivers else 5.0
-    with np.errstate(invalid='ignore'):
-        min_off = np.nanpercentile(min_by_driver, trim_pct, axis=1)
-        max_off = np.nanpercentile(max_by_driver, 100.0 - trim_pct, axis=1)
+    # A bin outside every single driver's own individually-measured lap range (rare -
+    # cars don't all record exactly the same total lap distance) leaves that bin
+    # all-NaN pre-trim; nanpercentile handles it (produces NaN, patched below by the
+    # ffill/bfill) but warns every time, which is just log noise for an already-
+    # handled case.
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='All-NaN slice encountered')
+        min_off = np.nanpercentile(offset_by_driver, trim_pct, axis=1)
+        max_off = np.nanpercentile(offset_by_driver, 100.0 - trim_pct, axis=1)
 
+    # Defensive only at this point (interpolation covers every bin already) - guards
+    # the pathological case of a bin outside every single driver's own lap range.
     min_off = pd.Series(min_off).ffill().bfill().to_numpy()
     max_off = pd.Series(max_off).ffill().bfill().to_numpy()
 
     return {
         'bins': bins, 'cx': cx, 'cy': cy, 'nx': nx, 'ny': ny,
         'min_off': min_off, 'max_off': max_off, 'bin_size': bin_size,
-        'driver_count': len(fastest_per_driver),
+        'driver_count': len(fastest_per_driver), 'valid': True,
     }
 
 
@@ -285,6 +359,12 @@ def get_driver_track_limit_violations(year, race, session_type, driver, lap_numb
         return telemetry_df.assign(Excess=[])
 
     envelope = get_track_limit_envelope(year, race, session_type)
+    if not envelope.get('valid', True):
+        # No corridor data this session - explicitly empty (no violations found) is
+        # not the right answer here, but there's no "unknown" DataFrame state, so an
+        # empty result plus the caller checking envelope['valid'] itself for messaging
+        # is how this stays distinguishable from a genuine zero-violations result.
+        return telemetry_df.iloc[0:0].copy().assign(Excess=[])
     bin_size = envelope['bin_size']
     idx = np.clip(np.round(telemetry_df['Distance'].to_numpy() / bin_size).astype(int),
                   0, len(envelope['bins']) - 1)
@@ -329,6 +409,51 @@ def add_sector_gate(fig, ref_tel, session_time, color, label):
     ))
 
 
+HOVER_SPEED_DISTANCE = (
+    'Lap %{customdata[2]}<br>Speed: %{customdata[0]:.0f} km/h<br>Distance: %{customdata[1]:.0f} m<extra></extra>'
+)
+
+
+def _speed_distance_customdata(tel_df, lap_number):
+    return np.stack([tel_df['Speed'], tel_df['Distance'], [lap_number] * len(tel_df)], axis=-1)
+
+
+def _driver_hover_template(driver):
+    return f'{driver} ' + HOVER_SPEED_DISTANCE
+
+
+def _apply_distance_or_corner_xaxis(fig_obj, corner_tick_vals, corner_tick_text, row, col):
+    if corner_tick_vals:
+        fig_obj.update_xaxes(title_text='Corner', tickmode='array', tickvals=corner_tick_vals,
+                              ticktext=corner_tick_text, color='white', gridcolor=TRACK_COLOR, row=row, col=col)
+    else:
+        fig_obj.update_xaxes(title_text='Distance (m)', color='white', gridcolor=TRACK_COLOR, row=row, col=col)
+
+
+def _style_subplot_figure(fig_obj, height):
+    fig_obj.update_layout(
+        plot_bgcolor=BG_COLOR, paper_bgcolor=BG_COLOR,
+        legend=dict(font=dict(color='white'), bgcolor=BG_COLOR),
+        margin=dict(l=10, r=10, t=40, b=10), height=height,
+        font=dict(color='white'),
+    )
+
+
+def _braking_points(lap_tel):
+    """X,Y of each point where the Brake channel rises from off to on along one lap
+    (sorted by Distance first) - i.e. where the driver first gets on the brakes for
+    each corner, not every sample where the brake happens to be applied.
+    """
+    tel = lap_tel.sort_values('Distance')
+    brake = tel['Brake'].astype(bool).to_numpy()
+    if len(brake) < 2:
+        return np.array([]), np.array([])
+    rising = np.zeros(len(brake), dtype=bool)
+    rising[1:] = (~brake[:-1]) & brake[1:]
+    x, y = tel['X'].to_numpy(), tel['Y'].to_numpy()
+    return x[rising], y[rising]
+
+
 with st.spinner("Downloading and processing session telemetry..."):
     session = get_session_data(selected_year, selected_race, session_dict[selected_session_type])
 
@@ -354,6 +479,33 @@ def render_driver_dashboard(session):
     if not selected_drivers:
         st.warning("Select at least one driver.")
         st.stop()
+
+    # --- Track map display options ---
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
+    with col_opt1:
+        corridor_all_drivers = st.checkbox(
+            "Corridor: use all drivers", value=False,
+            help="Off (default): build the track-limit corridor from only the fastest N drivers' "
+                 "laps (ranked by lap time, not finishing position), so it reflects racing-pace "
+                 "lines rather than being diluted by the whole field. On: every driver's fastest "
+                 "clean lap, like before.")
+        corridor_top_n = None
+        if not corridor_all_drivers:
+            corridor_top_n = st.slider("Corridor: fastest N laps", min_value=3,
+                                        max_value=max(len(driver_names), 3),
+                                        value=min(8, len(driver_names)))
+    with col_opt2:
+        color_by_speed = False
+        if view_mode == "Single Lap" and len(selected_drivers) == 1:
+            color_by_speed = st.checkbox(
+                "Color racing line by speed", value=False,
+                help="Single driver/lap only - replaces the driver-colored line with a speed "
+                     "heatmap along the racing line (braking zones cold, straights hot).")
+    with col_opt3:
+        show_braking_points = st.checkbox(
+            "Show braking points", value=(view_mode == "Single Lap"),
+            help="Marks where each driver first gets on the brakes for each corner "
+                 "(the Brake channel's rising edge), not every braking sample.")
 
     # Filter out slow laps (in/out laps, safety cars) so they don't ruin the visualization.
     # Fetched per-driver, so re-selecting a driver already viewed this session reuses
@@ -414,6 +566,9 @@ def render_driver_dashboard(session):
 
     # --- 5. Rendering the Dashboard ---
     with st.spinner(f"Plotting trajectories for {', '.join(laps_to_plot_map.keys())}..."):
+        # --- SHARED DATA PREP --- everything below needs this; if it fails, nothing
+        # else can render, so this is the one place a failure legitimately stops the
+        # whole dashboard rather than just one panel.
         try:
             driver_colors, driver_dash, seen_colors = {}, {}, {}
             for d in laps_to_plot_map:
@@ -440,6 +595,66 @@ def render_driver_dashboard(session):
                     f"check). The track outline/corridor below may have some rough spots."
                 )
 
+            envelope = get_track_limit_envelope(
+                selected_year, selected_race, session_dict[selected_session_type], top_n=corridor_top_n)
+
+            plot_lap_numbers_map = {
+                d: tuple(sorted(laps['LapNumber'].astype(int).tolist()))
+                for d, laps in laps_to_plot_map.items() if not laps.empty
+            }
+            telemetry_map = {
+                d: get_driver_lap_telemetry(
+                    selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
+                for d, lap_numbers in plot_lap_numbers_map.items()
+            }
+
+            # Corner positions/labels, computed once here since the track map and both
+            # throttle/brake plots below all need them.
+            corners = get_circuit_corners(
+                selected_year, selected_race, session_dict[selected_session_type])
+            corner_offset_x, corner_offset_y, corner_labels = None, None, None
+            corner_tick_vals, corner_tick_text = None, None
+            if corners is not None:
+                # Scale the label offset to the track's own footprint rather than a fixed
+                # number: a flat 500-unit offset put labels right on top of the track line
+                # for larger circuits (500 units is a much smaller fraction of a big track's
+                # span than a small one), which is why they looked cramped/underneath it.
+                track_span = max(ref_tel['X'].max() - ref_tel['X'].min(),
+                                  ref_tel['Y'].max() - ref_tel['Y'].min())
+                offset_dist = max(track_span * 0.08, 400)
+                # corners['Angle'] is FastF1's own precomputed direction for exactly this
+                # offset (see their circuit-info example): rotating the vector (offset, 0)
+                # by this angle points away from the track at that corner. We had sin/cos
+                # swapped between X and Y, which rotates that vector 90 degrees off from
+                # the intended direction - correct for many corners by chance, wrong for
+                # just as many others, which is why labels still sat on the track edge
+                # even after enlarging the offset distance alone.
+                angle_rad = np.radians(corners['Angle'])
+                corner_offset_x = corners['X'] + offset_dist * np.cos(angle_rad)
+                corner_offset_y = corners['Y'] + offset_dist * np.sin(angle_rad)
+                corner_labels = [
+                    f"{int(row['Number'])}{row['Letter'] if pd.notna(row['Letter']) else ''}"
+                    for _, row in corners.iterrows()
+                ]
+
+                # Distance-along-lap nearest each corner (via the reference lap's own
+                # Distance channel), so the throttle/brake plots can label their x-axis
+                # by corner instead of raw metres.
+                ref_x, ref_y, ref_d = ref_tel['X'].to_numpy(), ref_tel['Y'].to_numpy(), ref_tel['Distance'].to_numpy()
+                corner_dists = [
+                    ref_d[np.argmin((ref_x - row['X']) ** 2 + (ref_y - row['Y']) ** 2)]
+                    for _, row in corners.iterrows()
+                ]
+                order = np.argsort(corner_dists)
+                corner_tick_vals = [corner_dists[i] for i in order]
+                corner_tick_text = [corner_labels[i] for i in order]
+        except Exception as e:
+            st.warning(f"Error loading data for {', '.join(laps_to_plot_map.keys())}: {e}")
+            st.stop()
+
+        # --- TRACK MAP --- its own try/except so a failure here (e.g. a bad corner
+        # entry) can't take down the throttle/brake or tyre panels below, and vice versa.
+        try:
             fig = go.Figure()
 
             # --- BASE TRACK LAYER ---
@@ -452,52 +667,87 @@ def render_driver_dashboard(session):
             # --- TRACK LIMIT CORRIDOR ---
             # Shaded band = spread of every driver's own fastest lap around the reference
             # line. It approximates the "normal" racing corridor, not the physical curbs.
-            envelope = get_track_limit_envelope(
-                selected_year, selected_race, session_dict[selected_session_type])
-            edge_x = envelope['cx'] + envelope['nx'] * envelope['max_off']
-            edge_y = envelope['cy'] + envelope['ny'] * envelope['max_off']
-            other_edge_x = envelope['cx'] + envelope['nx'] * envelope['min_off']
-            other_edge_y = envelope['cy'] + envelope['ny'] * envelope['min_off']
+            # Skipped (with an explicit note, not a silent empty corridor) if no driver
+            # had a clean quicklap this session to build one from.
+            if envelope['valid']:
+                edge_x = envelope['cx'] + envelope['nx'] * envelope['max_off']
+                edge_y = envelope['cy'] + envelope['ny'] * envelope['max_off']
+                other_edge_x = envelope['cx'] + envelope['nx'] * envelope['min_off']
+                other_edge_y = envelope['cy'] + envelope['ny'] * envelope['min_off']
 
-            fig.add_trace(go.Scatter(
-                x=edge_x, y=edge_y, mode='lines',
-                line=dict(color=CORRIDOR_COLOR, width=1), hoverinfo='skip', showlegend=False,
-            ))
-            fig.add_trace(go.Scatter(
-                x=other_edge_x, y=other_edge_y, mode='lines',
-                line=dict(color=CORRIDOR_COLOR, width=1), fill='tonexty',
-                fillcolor='rgba(58, 58, 85, 0.35)', hoverinfo='skip',
-                name=f"Track-limit corridor ({envelope['driver_count']} drivers' fastest laps)",
-            ))
+                fig.add_trace(go.Scatter(
+                    x=edge_x, y=edge_y, mode='lines',
+                    line=dict(color=CORRIDOR_COLOR, width=1), hoverinfo='skip', showlegend=False,
+                ))
+                corridor_label = (f"Track-limit corridor ({envelope['driver_count']} drivers' fastest laps)"
+                                   if corridor_all_drivers else
+                                   f"Track-limit corridor (fastest {envelope['driver_count']} laps)")
+                fig.add_trace(go.Scatter(
+                    x=other_edge_x, y=other_edge_y, mode='lines',
+                    line=dict(color=CORRIDOR_COLOR, width=1), fill='tonexty',
+                    fillcolor='rgba(58, 58, 85, 0.35)', hoverinfo='skip',
+                    name=corridor_label,
+                ))
+            else:
+                st.info("No driver had a clean quick lap this session, so no track-limit corridor "
+                        "could be built - the map below shows racing lines only, with no corridor "
+                        "shading or 'wide of corridor' markers.")
 
             # --- PLOT EVERY SELECTED LAP (per driver) ---
-            plot_lap_numbers_map = {
-                d: tuple(sorted(laps['LapNumber'].astype(int).tolist()))
-                for d, laps in laps_to_plot_map.items() if not laps.empty
-            }
-            telemetry_map = {
-                d: get_driver_lap_telemetry(
-                    selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
-                for d, lap_numbers in plot_lap_numbers_map.items()
-            }
+            braking_points_by_driver = {d: ([], []) for d in telemetry_map}
 
-            for d, telemetry_df in telemetry_map.items():
-                for i, (lap_number, lap_tel) in enumerate(telemetry_df.groupby('LapNumber')):
-                    plot_tel = _decimate(lap_tel)
-                    fig.add_trace(go.Scattergl(
-                        x=plot_tel['X'], y=plot_tel['Y'], mode='lines',
-                        line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                        opacity=alpha_val,
-                        name=f'{d} Trajectory' if i == 0 else None,
-                        legendgroup=f'driver_{d}', showlegend=(i == 0),
-                        customdata=np.stack([plot_tel['Speed'], plot_tel['Distance'],
-                                              [lap_number] * len(plot_tel)], axis=-1),
-                        hovertemplate=(
-                            f'{d} Lap %{{customdata[2]}}<br>'
-                            'Speed: %{customdata[0]:.0f} km/h<br>'
-                            'Distance: %{customdata[1]:.0f} m<extra></extra>'
-                        ),
-                    ))
+            if color_by_speed and len(telemetry_map) == 1:
+                # Single driver/lap only (enforced by the checkbox's own visibility
+                # condition above): a speed heatmap in place of the normal driver-
+                # colored line - braking zones read cold, straights hot.
+                d = next(iter(telemetry_map))
+                lap_tel = telemetry_map[d]
+                plot_tel = _decimate(lap_tel)
+                fig.add_trace(go.Scattergl(
+                    x=plot_tel['X'], y=plot_tel['Y'], mode='markers',
+                    marker=dict(
+                        size=4, color=plot_tel['Speed'], colorscale='Turbo', showscale=True,
+                        colorbar=dict(title=dict(text='Speed (km/h)', font=dict(color='white')),
+                                      tickfont=dict(color='white'), x=1.02),
+                    ),
+                    name=f'{d} Trajectory (speed)',
+                    customdata=_speed_distance_customdata(plot_tel, plot_tel['LapNumber'].iloc[0]),
+                    hovertemplate=_driver_hover_template(d),
+                ))
+                if show_braking_points:
+                    bx, by = _braking_points(lap_tel)
+                    braking_points_by_driver[d] = (list(bx), list(by))
+            else:
+                for d, telemetry_df in telemetry_map.items():
+                    for i, (lap_number, lap_tel) in enumerate(telemetry_df.groupby('LapNumber')):
+                        plot_tel = _decimate(lap_tel)
+                        fig.add_trace(go.Scattergl(
+                            x=plot_tel['X'], y=plot_tel['Y'], mode='lines',
+                            line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
+                            opacity=alpha_val,
+                            name=f'{d} Trajectory' if i == 0 else None,
+                            legendgroup=f'driver_{d}', showlegend=(i == 0),
+                            customdata=_speed_distance_customdata(plot_tel, lap_number),
+                            hovertemplate=_driver_hover_template(d),
+                        ))
+                        if show_braking_points:
+                            bx, by = _braking_points(lap_tel)
+                            braking_points_by_driver[d][0].extend(bx)
+                            braking_points_by_driver[d][1].extend(by)
+
+            # --- BRAKING POINTS (per driver) ---
+            # Where the Brake channel first rises (not every braking sample), i.e. the
+            # point a driver gets on the brakes for each corner.
+            if show_braking_points:
+                for d, (bx, by) in braking_points_by_driver.items():
+                    if len(bx):
+                        fig.add_trace(go.Scattergl(
+                            x=bx, y=by, mode='markers',
+                            marker=dict(symbol='triangle-down', size=9, color=driver_colors[d],
+                                        line=dict(color='white', width=1)),
+                            name=f'{d} braking points', legendgroup=f'driver_{d}',
+                            hoverinfo='skip',
+                        ))
 
             # --- LAP SCRUBBER (Lap Interval mode only) ---
             # A Plotly frame/slider, not a Streamlit widget: switching frames happens
@@ -517,13 +767,8 @@ def render_driver_dashboard(session):
                         x=first_tel['X'], y=first_tel['Y'], mode='lines',
                         line=dict(color=driver_colors[d], width=max(line_width * 2, 3), dash=driver_dash[d]),
                         name=f'{d} (scrub)',
-                        customdata=np.stack([first_tel['Speed'], first_tel['Distance'],
-                                              [first_lap] * len(first_tel)], axis=-1),
-                        hovertemplate=(
-                            f'{d} Lap %{{customdata[2]}}<br>'
-                            'Speed: %{customdata[0]:.0f} km/h<br>'
-                            'Distance: %{customdata[1]:.0f} m<extra></extra>'
-                        ),
+                        customdata=_speed_distance_customdata(first_tel, first_lap),
+                        hovertemplate=_driver_hover_template(d),
                     ))
 
                 frames = []
@@ -535,8 +780,7 @@ def render_driver_dashboard(session):
                             lap_tel = _decimate(telemetry_map[d][telemetry_map[d]['LapNumber'] == lap_number])
                             frame_data.append(go.Scattergl(
                                 x=lap_tel['X'], y=lap_tel['Y'],
-                                customdata=np.stack([lap_tel['Speed'], lap_tel['Distance'],
-                                                      [lap_number] * len(lap_tel)], axis=-1),
+                                customdata=_speed_distance_customdata(lap_tel, lap_number),
                             ))
                         else:
                             frame_data.append(go.Scattergl(x=[], y=[], customdata=np.empty((0, 3))))
@@ -561,62 +805,51 @@ def render_driver_dashboard(session):
 
             # --- TRACK LIMIT VIOLATIONS (per driver) ---
             # Points where a selected driver ran wider than every other driver's own
-            # fastest lap at that point on track.
-            violation_summaries = []
-            for d, lap_numbers in plot_lap_numbers_map.items():
-                violations = get_driver_track_limit_violations(
-                    selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
-                if violations.empty:
-                    continue
-                fig.add_trace(go.Scattergl(
-                    x=violations['X'], y=violations['Y'], mode='markers',
-                    marker=dict(size=5, color=VIOLATION_COLOR, symbol='circle'),
-                    name='Wide of corridor' if not violation_summaries else None,
-                    legendgroup='violations', showlegend=(not violation_summaries),
-                    customdata=np.stack([violations['LapNumber'], violations['Excess']], axis=-1),
-                    hovertemplate=f'{d} Lap %{{customdata[0]}}<br>+%{{customdata[1]:.1f}} m wide<extra></extra>',
-                ))
-                violation_summaries.append(
-                    f"{d}: {len(violations)} points (max {violations['Excess'].max():.1f} m beyond)")
-
-            if violation_summaries:
-                st.caption("Ran wider than the fastest-lap corridor - " + "; ".join(violation_summaries))
+            # fastest lap at that point on track. Unavailable (explicitly, not as a
+            # silent "zero violations") when there's no corridor to compare against.
+            if not envelope['valid']:
+                st.caption("Track-limit violations unavailable - no corridor data this session.")
             else:
-                st.caption("All selected drivers stayed within the fastest-lap corridor for the selected lap(s).")
+                violation_summaries = []
+                for d, lap_numbers in plot_lap_numbers_map.items():
+                    violations = get_driver_track_limit_violations(
+                        selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
+                    if violations.empty:
+                        continue
+                    fig.add_trace(go.Scattergl(
+                        x=violations['X'], y=violations['Y'], mode='markers',
+                        marker=dict(size=5, color=VIOLATION_COLOR, symbol='circle'),
+                        name='Wide of corridor' if not violation_summaries else None,
+                        legendgroup='violations', showlegend=(not violation_summaries),
+                        customdata=np.stack([violations['LapNumber'], violations['Excess']], axis=-1),
+                        hovertemplate=f'{d} Lap %{{customdata[0]}}<br>+%{{customdata[1]:.1f}} m wide<extra></extra>',
+                    ))
+                    violation_summaries.append(
+                        f"{d}: {len(violations)} points (max {violations['Excess'].max():.1f} m beyond)")
+
+                if violation_summaries:
+                    st.caption("Ran wider than the fastest-lap corridor - " + "; ".join(violation_summaries))
+                else:
+                    st.caption(
+                        "All selected drivers stayed within the fastest-lap corridor for the selected lap(s).")
 
             # --- SECTOR GATES ---
-            add_sector_gate(fig, ref_tel, sf_time, SECTOR_COLORS['Start/Finish'], 'Start/Finish')
-            add_sector_gate(fig, ref_tel, sector1_time, SECTOR_COLORS['Sector 1 Split'], 'Sector 1 Split')
-            add_sector_gate(fig, ref_tel, sector2_time, SECTOR_COLORS['Sector 2 Split'], 'Sector 2 Split')
+            # Guarded against NaT: a fastest lap occasionally has a missing sector
+            # timestamp (a real FastF1 data gap), which previously crashed sector-gate
+            # placement and, via one blanket except around the whole dashboard, took
+            # every other panel down with it too. Now a missing sector time just skips
+            # that one gate.
+            for session_time, color, label in (
+                (sf_time, SECTOR_COLORS['Start/Finish'], 'Start/Finish'),
+                (sector1_time, SECTOR_COLORS['Sector 1 Split'], 'Sector 1 Split'),
+                (sector2_time, SECTOR_COLORS['Sector 2 Split'], 'Sector 2 Split'),
+            ):
+                if pd.notna(session_time):
+                    add_sector_gate(fig, ref_tel, session_time, color, label)
 
             # --- TURN NUMBERS ---
-            corners = get_circuit_corners(
-                selected_year, selected_race, session_dict[selected_session_type])
-            corner_tick_vals, corner_tick_text = None, None
             if corners is not None:
-                # Scale the label offset to the track's own footprint rather than a fixed
-                # number: a flat 500-unit offset put labels right on top of the track line
-                # for larger circuits (500 units is a much smaller fraction of a big track's
-                # span than a small one), which is why they looked cramped/underneath it.
-                track_span = max(ref_tel['X'].max() - ref_tel['X'].min(),
-                                  ref_tel['Y'].max() - ref_tel['Y'].min())
-                offset_dist = max(track_span * 0.08, 400)
-                # corners['Angle'] is FastF1's own precomputed direction for exactly this
-                # offset (see their circuit-info example): rotating the vector (offset, 0)
-                # by this angle points away from the track at that corner. We had sin/cos
-                # swapped between X and Y, which rotates that vector 90 degrees off from
-                # the intended direction - correct for many corners by chance, wrong for
-                # just as many others, which is why labels still sat on the track edge
-                # even after enlarging the offset distance alone.
-                angle_rad = np.radians(corners['Angle'])
-                offset_x = corners['X'] + offset_dist * np.cos(angle_rad)
-                offset_y = corners['Y'] + offset_dist * np.sin(angle_rad)
-                labels = [
-                    f"{int(row['Number'])}{row['Letter'] if pd.notna(row['Letter']) else ''}"
-                    for _, row in corners.iterrows()
-                ]
-
-                for x0, y0, x1, y1 in zip(corners['X'], corners['Y'], offset_x, offset_y):
+                for x0, y0, x1, y1 in zip(corners['X'], corners['Y'], corner_offset_x, corner_offset_y):
                     fig.add_trace(go.Scattergl(
                         x=[x0, x1], y=[y0, y1], mode='lines',
                         line=dict(color='#555566', width=1, dash='dot'),
@@ -624,24 +857,12 @@ def render_driver_dashboard(session):
                     ))
 
                 fig.add_trace(go.Scatter(
-                    x=offset_x, y=offset_y, mode='markers+text',
-                    text=labels, textposition='middle center',
+                    x=corner_offset_x, y=corner_offset_y, mode='markers+text',
+                    text=corner_labels, textposition='middle center',
                     textfont=dict(color='white', size=10, family='Arial Black'),
                     marker=dict(size=20, color=CORNER_MARKER_COLOR, line=dict(color='white', width=1)),
                     name='Corners', hoverinfo='skip', showlegend=False,
                 ))
-
-                # Distance-along-lap nearest each corner (via the reference lap's own
-                # Distance channel), so the throttle/brake plot below can label its x-axis
-                # by corner instead of raw metres.
-                ref_x, ref_y, ref_d = ref_tel['X'].to_numpy(), ref_tel['Y'].to_numpy(), ref_tel['Distance'].to_numpy()
-                corner_dists = [
-                    ref_d[np.argmin((ref_x - row['X']) ** 2 + (ref_y - row['Y']) ** 2)]
-                    for _, row in corners.iterrows()
-                ]
-                order = np.argsort(corner_dists)
-                corner_tick_vals = [corner_dists[i] for i in order]
-                corner_tick_text = [labels[i] for i in order]
 
             fig.update_layout(
                 plot_bgcolor=BG_COLOR, paper_bgcolor=BG_COLOR,
@@ -652,19 +873,43 @@ def render_driver_dashboard(session):
                           f"{', '.join(telemetry_map.keys())}"),
                     font=dict(color='white', size=18),
                 ),
-                legend=dict(font=dict(color='white'), bgcolor=BG_COLOR),
-                margin=dict(l=10, r=10, t=60, b=10),
+                # Horizontal legend below the plot rather than Plotly's default
+                # right-hand-side placement, which sat directly on top of the speed
+                # colorbar (color-by-speed mode) - now they occupy different regions
+                # regardless of how many legend entries there are.
+                legend=dict(font=dict(color='white'), bgcolor=BG_COLOR,
+                             orientation='h', yanchor='top', y=-0.02, xanchor='center', x=0.5),
+                margin=dict(l=10, r=10, t=60, b=80),
                 height=800,
             )
 
             st.plotly_chart(fig, use_container_width=True)
 
-            # --- THROTTLE & BRAKE ---
-            # Same driver/lap selection as the track map above, plotted against Distance.
-            # Colored by driver (matching the track map) rather than a fixed throttle/
-            # brake color scheme, since with multiple drivers selected the important
-            # distinction is who's who, not which channel is which - that's already
-            # clear from the subplot titles.
+            # --- CSV EXPORT --- whatever telemetry is currently plotted above (all
+            # selected drivers/laps, full resolution - not the decimated display copy).
+            export_df = pd.concat(
+                [df.assign(Driver=d) for d, df in telemetry_map.items()],
+                ignore_index=True,
+            ) if telemetry_map else pd.DataFrame()
+            if not export_df.empty:
+                file_stub = f"{selected_year}_{selected_race}_{selected_session_type}".replace(' ', '_')
+                st.download_button(
+                    "Download telemetry as CSV",
+                    data=export_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"{file_stub}_telemetry.csv",
+                    mime='text/csv',
+                )
+        except Exception as e:
+            st.warning(f"Error plotting the track map: {e}")
+
+        # --- THROTTLE & BRAKE --- own try/except: a failure here shouldn't take down
+        # the track map above or the tyre panel below.
+        # Same driver/lap selection as the track map above, plotted against Distance.
+        # Colored by driver (matching the track map) rather than a fixed throttle/
+        # brake color scheme, since with multiple drivers selected the important
+        # distinction is who's who, not which channel is which - that's already
+        # clear from the subplot titles.
+        try:
             st.markdown("### Throttle & Brake")
             tb_fig = make_subplots(
                 rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
@@ -687,28 +932,23 @@ def render_driver_dashboard(session):
                         legendgroup=f'driver_{d}',
                     ), row=2, col=1)
 
-            tb_fig.update_layout(
-                plot_bgcolor=BG_COLOR, paper_bgcolor=BG_COLOR,
-                legend=dict(font=dict(color='white'), bgcolor=BG_COLOR),
-                margin=dict(l=10, r=10, t=40, b=10), height=450,
-                font=dict(color='white'),
-            )
-            if corner_tick_vals:
-                tb_fig.update_xaxes(title_text='Corner', tickmode='array', tickvals=corner_tick_vals,
-                                     ticktext=corner_tick_text, color='white', gridcolor=TRACK_COLOR, row=2, col=1)
-            else:
-                tb_fig.update_xaxes(title_text='Distance (m)', color='white', gridcolor=TRACK_COLOR, row=2, col=1)
+            _style_subplot_figure(tb_fig, height=450)
+            _apply_distance_or_corner_xaxis(tb_fig, corner_tick_vals, corner_tick_text, row=2, col=1)
             tb_fig.update_yaxes(title_text='Throttle %', color='white', gridcolor=TRACK_COLOR, row=1, col=1)
             tb_fig.update_yaxes(title_text='Brake', color='white', gridcolor=TRACK_COLOR, row=2, col=1)
             st.plotly_chart(tb_fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Error plotting throttle/brake: {e}")
 
-            # --- TYRE DEGRADATION VS THROTTLE/BRAKE ---
-            # Independent of the lap selection above: pick a whole stint so brake/throttle
-            # points can be compared across the tyre's full life, colored from fresh
-            # (light) to worn (dark red) by TyreLife. Scoped to one driver at a time -
-            # different drivers have different stints/compounds/lap numbers, so "tyre
-            # degradation" doesn't have a single shared meaning across several drivers
-            # the way the racing line and throttle/brake comparisons above do.
+        # --- TYRE DEGRADATION VS THROTTLE/BRAKE --- own try/except so a failure here
+        # can't take down the charts above.
+        # Independent of the lap selection above: pick a whole stint so brake/throttle
+        # points can be compared across the tyre's full life, colored from fresh
+        # (light) to worn (dark red) by TyreLife. Scoped to one driver at a time -
+        # different drivers have different stints/compounds/lap numbers, so "tyre
+        # degradation" doesn't have a single shared meaning across several drivers
+        # the way the racing line and throttle/brake comparisons above do.
+        try:
             st.markdown("### Tyre Degradation vs Throttle/Brake")
             tyre_candidates = list(telemetry_map.keys())
             tyre_driver = (tyre_candidates[0] if len(tyre_candidates) == 1
@@ -741,35 +981,99 @@ def render_driver_dashboard(session):
                         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                         subplot_titles=('Throttle (%) by tyre age', 'Brake by tyre age'),
                     )
+                    stint_laps_sorted = sorted(int(n) for n in stint_tel['LapNumber'].unique())
+                    # Fade the full-stint overlay once there's more than a couple of laps,
+                    # so the scrub highlight below (added at full opacity/width) actually
+                    # stands out instead of blending into the color gradient.
+                    context_alpha = 1.0 if len(stint_laps_sorted) <= 2 else 0.35
+                    lap_colors = {}
+                    context_trace_indices = []
                     for lap_number, lap_tel in stint_tel.groupby('LapNumber'):
                         life = lap_tel['TyreLife'].iloc[0]
                         frac = (life - min_life) / life_span
                         color = pcolors.sample_colorscale('YlOrRd', frac)[0]
+                        lap_colors[int(lap_number)] = color
+                        context_trace_indices.append(len(tyre_fig.data))
                         tyre_fig.add_trace(go.Scattergl(
                             x=lap_tel['Distance'], y=lap_tel['Throttle'], mode='lines',
-                            line=dict(color=color, width=1.5),
+                            line=dict(color=color, width=1.5), opacity=context_alpha,
                             name=f'Lap {int(lap_number)} (Tyre life {int(life)})',
                             legendgroup=f'lap{lap_number}',
                         ), row=1, col=1)
+                        context_trace_indices.append(len(tyre_fig.data))
                         tyre_fig.add_trace(go.Scattergl(
                             x=lap_tel['Distance'], y=lap_tel['Brake'].astype(float), mode='lines',
-                            line=dict(color=color, width=1.5), showlegend=False,
+                            line=dict(color=color, width=1.5), opacity=context_alpha, showlegend=False,
                             legendgroup=f'lap{lap_number}',
                         ), row=2, col=1)
 
-                    tyre_fig.update_layout(
-                        plot_bgcolor=BG_COLOR, paper_bgcolor=BG_COLOR,
-                        legend=dict(font=dict(color='white'), bgcolor=BG_COLOR),
-                        margin=dict(l=10, r=10, t=40, b=10), height=500,
-                        font=dict(color='white'),
-                    )
-                    if corner_tick_vals:
-                        tyre_fig.update_xaxes(title_text='Corner', tickmode='array', tickvals=corner_tick_vals,
-                                               ticktext=corner_tick_text, color='white', gridcolor=TRACK_COLOR,
-                                               row=2, col=1)
-                    else:
-                        tyre_fig.update_xaxes(title_text='Distance (m)', color='white', gridcolor=TRACK_COLOR,
-                                               row=2, col=1)
+                    # --- LAP SCRUB HIGHLIGHT --- a Plotly frame/slider (client-side, no
+                    # Streamlit rerun) that isolates one lap at a time on top of the
+                    # faded stint overlay above, so a single lap's throttle/brake shape
+                    # is easy to pick out instead of reading it off an overlaid gradient.
+                    if len(stint_laps_sorted) > 1:
+                        first_lap = stint_laps_sorted[0]
+                        first_tel = stint_tel[stint_tel['LapNumber'] == first_lap]
+                        throttle_idx = len(tyre_fig.data)
+                        tyre_fig.add_trace(go.Scattergl(
+                            x=first_tel['Distance'], y=first_tel['Throttle'], mode='lines',
+                            line=dict(color=lap_colors[first_lap], width=3.5),
+                            name='Highlighted lap', legendgroup='highlight',
+                        ), row=1, col=1)
+                        brake_idx = len(tyre_fig.data)
+                        tyre_fig.add_trace(go.Scattergl(
+                            x=first_tel['Distance'], y=first_tel['Brake'].astype(float), mode='lines',
+                            line=dict(color=lap_colors[first_lap], width=3.5), showlegend=False,
+                            legendgroup='highlight',
+                        ), row=2, col=1)
+
+                        frames = []
+                        for lap_number in stint_laps_sorted:
+                            lap_tel = stint_tel[stint_tel['LapNumber'] == lap_number]
+                            color = lap_colors[lap_number]
+                            frames.append(go.Frame(
+                                name=str(lap_number),
+                                data=[
+                                    go.Scattergl(x=lap_tel['Distance'], y=lap_tel['Throttle'],
+                                                 line=dict(color=color)),
+                                    go.Scattergl(x=lap_tel['Distance'], y=lap_tel['Brake'].astype(float),
+                                                 line=dict(color=color)),
+                                ],
+                                traces=[throttle_idx, brake_idx],
+                            ))
+                        tyre_fig.frames = frames
+                        tyre_fig.update_layout(
+                            sliders=[dict(
+                                active=0,
+                                currentvalue=dict(prefix='Highlight lap: ', font=dict(color='white')),
+                                pad=dict(t=20),
+                                font=dict(color='white'),
+                                steps=[dict(
+                                    method='animate',
+                                    args=[[str(lap_number)], dict(mode='immediate',
+                                                                   frame=dict(duration=0, redraw=True),
+                                                                   transition=dict(duration=0))],
+                                    label=str(lap_number),
+                                ) for lap_number in stint_laps_sorted],
+                            )],
+                            # Client-side toggle (Plotly restyle, no Streamlit rerun) between
+                            # the full faded overlay and hiding every lap except whichever one
+                            # the slider above is currently pointed at.
+                            updatemenus=[dict(
+                                type='buttons', direction='left',
+                                x=0.0, xanchor='left', y=1.15, yanchor='top',
+                                bgcolor=BG_COLOR, font=dict(color='white'),
+                                buttons=[
+                                    dict(label='Show all laps', method='restyle',
+                                         args=[{'opacity': context_alpha}, context_trace_indices]),
+                                    dict(label='Show only selected lap', method='restyle',
+                                         args=[{'opacity': 0}, context_trace_indices]),
+                                ],
+                            )],
+                        )
+
+                    _style_subplot_figure(tyre_fig, height=500)
+                    _apply_distance_or_corner_xaxis(tyre_fig, corner_tick_vals, corner_tick_text, row=2, col=1)
                     tyre_fig.update_yaxes(title_text='Throttle %', color='white', gridcolor=TRACK_COLOR,
                                            row=1, col=1)
                     tyre_fig.update_yaxes(title_text='Brake', color='white', gridcolor=TRACK_COLOR,
@@ -777,11 +1081,104 @@ def render_driver_dashboard(session):
                     st.plotly_chart(tyre_fig, use_container_width=True)
                     st.caption(
                         "Line color shifts from light to dark red as the tyre ages within the stint "
-                        "(darker = more worn). Compare traces across laps to see how braking points "
-                        "and throttle application shift as the tyre degrades."
+                        "(darker = more worn). Use the slider under the plot to pick a lap, and the "
+                        "'Show only selected lap' button above the plot to hide the rest of the stint "
+                        "entirely - both work in the browser, no page refresh needed."
                     )
         except Exception as e:
-            st.warning(f"Error plotting data: {e}")
+            st.warning(f"Error plotting tyre degradation: {e}")
 
 
 render_driver_dashboard(session)
+
+
+def render_position_changes(session, year, race, session_type_label, session_type_code):
+    # Race/Sprint only: Qualifying doesn't have a persistent running position across
+    # a session the way a race does (it's knockout stages, not a continuous order).
+    if session_type_code not in ('R', 'S'):
+        return
+
+    st.markdown("---")
+    st.markdown("### Position Changes")
+
+    with st.spinner("Building position-changes chart..."):
+        try:
+            laps, results = get_position_progression(year, race, session_type_code)
+        except Exception as e:
+            st.warning(f"Error loading position data: {e}")
+            return
+
+    if laps.empty or results.empty:
+        st.caption("No lap-by-lap position data available for this session.")
+        return
+
+    results = results.dropna(subset=['GridPosition'])
+    if results.empty:
+        st.caption("No starting grid data available for this session.")
+        return
+
+    no_grid_data = sorted(set(laps['Driver'].unique()) - set(results['Driver']))
+    if no_grid_data:
+        st.caption(f"No starting grid data for: {', '.join(no_grid_data)} - excluded from this chart.")
+
+    try:
+        num_drivers = len(results)
+        drop_position = num_drivers + 1
+        max_lap = int(laps['LapNumber'].max())
+
+        fig = go.Figure()
+        for _, row in results.sort_values('GridPosition').iterrows():
+            d = row['Driver']
+            grid_pos = row['GridPosition']
+            driver_laps = laps[laps['Driver'] == d].sort_values('LapNumber')
+
+            # Start every line at its actual starting GRID slot (lap 0) - this is what
+            # bakes penalties/pit-lane starts into the chart, rather than just
+            # replaying qualifying order - then follow the real per-lap running
+            # position from lap 1 onward.
+            x_vals = [0] + driver_laps['LapNumber'].tolist()
+            y_vals = [grid_pos] + driver_laps['Position'].tolist()
+
+            if row['Status'] not in FINISHED_STATUSES and not driver_laps.empty:
+                last_lap = int(driver_laps['LapNumber'].max())
+                x_vals.append(last_lap + 1)
+                y_vals.append(drop_position)
+
+            color = get_driver_color_cached(year, race, session_type_code, d)
+            fig.add_trace(go.Scattergl(
+                x=x_vals, y=y_vals, mode='lines',
+                line=dict(color=color, width=2),
+                name=d,
+                hovertemplate=f'{d}<br>Lap %{{x}}<br>P%{{y}}<extra></extra>',
+            ))
+            fig.add_annotation(
+                x=0, y=grid_pos, text=d, showarrow=False,
+                xanchor='right', xshift=-8,
+                font=dict(color=color, size=11),
+            )
+
+        fig.update_layout(
+            plot_bgcolor=BG_COLOR, paper_bgcolor=BG_COLOR,
+            xaxis=dict(title='Lap', color='white', gridcolor=TRACK_COLOR, range=[-3, max_lap + 1]),
+            yaxis=dict(title='Position', color='white', gridcolor=TRACK_COLOR,
+                       dtick=1, range=[drop_position + 1, 0]),
+            title=dict(
+                text=f"{year} {race} ({session_type_label}) - Position Changes",
+                font=dict(color='white', size=18),
+            ),
+            showlegend=False,
+            margin=dict(l=60, r=10, t=60, b=10),
+            height=700,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Starting position is the actual starting grid (after any penalties or pit-lane "
+            "starts), not qualifying classification. A line dropping off the bottom marks a "
+            "retirement (DNF/DNS) at that lap."
+        )
+    except Exception as e:
+        st.warning(f"Error plotting position changes: {e}")
+
+
+render_position_changes(session, selected_year, selected_race, selected_session_type,
+                         session_dict[selected_session_type])

@@ -202,6 +202,23 @@ with st.expander("📅 Race Calendar (Romania Time)", expanded=False):
 def get_session_data(year, race, session_type):
     session = fastf1.get_session(year, race, session_type)
     session.load(telemetry=True, laps=True, weather=False, messages=False)
+    # FastF1's load() can return normally even when one data type (laps, here) failed
+    # to populate for this specific session - accessing it later then throws
+    # DataNotLoadedError deep inside the dashboard instead of here. Checking now, and
+    # raising if it's missing, matters for more than a cleaner error: since this
+    # function is st.cache_resource-cached, a successful return caches the session
+    # object as "good" even with laps missing, so every future call for this same
+    # (year, race, session_type) would hand back the same broken object and fail the
+    # same way forever, until the server process restarts. Raising here instead means
+    # cache_resource does NOT cache it, so the next attempt gets a fresh retry.
+    try:
+        _ = session.laps
+    except fastf1.exceptions.DataNotLoadedError as e:
+        raise RuntimeError(
+            f"Lap data isn't available for {race} {year} ({session_type}) - it may not be "
+            f"published yet, or the data source had trouble loading it. Try again, or pick "
+            f"a different session."
+        ) from e
     return session
 
 
@@ -714,7 +731,11 @@ def _braking_points(lap_tel):
 
 
 with st.spinner("Downloading and processing session telemetry..."):
-    session = get_session_data(selected_year, selected_race, session_dict[selected_session_type])
+    try:
+        session = get_session_data(selected_year, selected_race, session_dict[selected_session_type])
+    except Exception as e:
+        st.error(f"Couldn't load {selected_race} {selected_year} ({selected_session_type}): {e}")
+        st.stop()
 
 
 @st.fragment

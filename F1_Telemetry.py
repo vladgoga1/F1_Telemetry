@@ -844,23 +844,16 @@ def render_driver_dashboard(session):
     max_lap = max(int(laps['LapNumber'].max()) for laps in driver_laps_map.values())
 
     if view_mode == "Single Lap":
-        if color_by_speed and len(driver_laps_map) == 1:
-            # Speed-heatmap mode needs one specific lap picked server-side (its
-            # marker colors are computed from that lap's own Speed values), so it
-            # keeps the plain slider + fragment rerun rather than the client-side
-            # scrubber used below.
-            selected_lap = st.slider("Select Lap", min_value=min_lap, max_value=max_lap, value=min_lap)
-            laps_to_plot_map = {d: laps[laps['LapNumber'] == selected_lap] for d, laps in driver_laps_map.items()}
-        else:
-            # Every quick lap is fetched once, up front (the same call "Average
-            # Trend" mode already uses) - the track map below then lets you scrub
-            # between laps entirely client-side (a Plotly slider, no Streamlit
-            # rerun and no repeat FastF1 fetch per lap), which is what actually
-            # made "Select Lap" feel slow before: every lap change forced a full
-            # fragment rerun plus a fresh per-lap telemetry fetch.
-            laps_to_plot_map = driver_laps_map
-            st.caption("Drag the lap slider under the track map to switch laps instantly - "
-                       "no page reload needed.")
+        # Fetches just the one selected lap per driver (a fragment-scoped rerun per
+        # change, ~1s/lap) rather than eagerly fetching every quick lap up front for
+        # client-side scrubbing - that traded a fast "select a lap" experience for a
+        # very slow first look at any driver not already viewed this session (~50-70
+        # laps x ~1s each, since parallelizing the fetch measured SLOWER than
+        # sequential - see get_single_lap_telemetry). Switching drivers matters more
+        # than instant lap-to-lap scrubbing, so this keeps the simpler, faster-to-
+        # switch behavior.
+        selected_lap = st.slider("Select Lap", min_value=min_lap, max_value=max_lap, value=min_lap)
+        laps_to_plot_map = {d: laps[laps['LapNumber'] == selected_lap] for d, laps in driver_laps_map.items()}
         alpha_val = 1.0
         line_width = 2
 
@@ -971,13 +964,6 @@ def render_driver_dashboard(session):
                 corner_tick_vals = [corner_dists[i] for i in order]
                 corner_tick_text = [corner_labels[i] for i in order]
 
-            # Single Lap mode (color-by-speed excepted, handled in its own branch
-            # below) now always loads every quick lap up front - see the view-mode
-            # block above - so both the track map and throttle/brake panels can
-            # scrub between laps via a client-side Plotly frame/slider instead of
-            # a plain per-lap-fetching Streamlit slider.
-            is_single_lap_scrub = (view_mode == "Single Lap"
-                                    and not (color_by_speed and len(telemetry_map) == 1))
         except Exception as e:
             st.warning(f"Error loading data for {', '.join(laps_to_plot_map.keys())}: {e}")
             st.stop()
@@ -1025,241 +1011,133 @@ def render_driver_dashboard(session):
 
             braking_points_by_driver = {d: ([], []) for d in telemetry_map}
 
-            if is_single_lap_scrub:
-                # --- SINGLE LAP: CLIENT-SIDE SCRUBBER ---
-                # One persistent trace per driver (line, plus braking-point/violation
-                # marker traces if enabled) rather than one trace per lap - laps are
-                # switched by swapping each trace's data via a Plotly frame, showing
-                # only the single active lap (no faded multi-lap context) to match
-                # this mode's look.
-                all_lap_numbers = sorted(set(n for nums in plot_lap_numbers_map.values() for n in nums))
-                if not all_lap_numbers:
-                    st.warning("No laps available to plot.")
-                else:
-                    violations_by_driver = {}
-                    if envelope['valid']:
-                        for d, lap_numbers in plot_lap_numbers_map.items():
-                            violations_by_driver[d] = get_driver_track_limit_violations(
-                                selected_year, selected_race, session_dict[selected_session_type],
-                                d, lap_numbers)
-
-                    line_trace_idx, brake_trace_idx, violation_trace_idx = {}, {}, {}
-
-                    for d, lap_numbers in plot_lap_numbers_map.items():
-                        first_lap = lap_numbers[0]
-                        first_lap_tel = telemetry_map[d][telemetry_map[d]['LapNumber'] == first_lap]
-                        first_tel = _decimate(first_lap_tel)
-
-                        line_trace_idx[d] = len(fig.data)
+            # --- MAIN RACING LINE(S) ---
+            if color_by_speed and len(telemetry_map) == 1:
+                # Single driver/lap only (enforced by the checkbox's own visibility
+                # condition above): a speed heatmap in place of the normal driver-
+                # colored line - braking zones read cold, straights hot.
+                d = next(iter(telemetry_map))
+                lap_tel = telemetry_map[d]
+                plot_tel = _decimate(lap_tel)
+                fig.add_trace(go.Scattergl(
+                    x=plot_tel['X'], y=plot_tel['Y'], mode='markers',
+                    marker=dict(
+                        size=4, color=plot_tel['Speed'], colorscale='Turbo', showscale=True,
+                        colorbar=dict(title=dict(text='Speed (km/h)', font=dict(color='white')),
+                                      tickfont=dict(color='white'), x=1.02),
+                    ),
+                    name=f'{d} Trajectory (speed)',
+                    customdata=_speed_distance_customdata(plot_tel, plot_tel['LapNumber'].iloc[0]),
+                    hovertemplate=_driver_hover_template(d),
+                ))
+                if show_braking_points:
+                    bx, by = _braking_points(lap_tel)
+                    braking_points_by_driver[d] = (list(bx), list(by))
+            elif view_mode == "Single Lap":
+                for d, telemetry_df in telemetry_map.items():
+                    for i, (lap_number, lap_tel) in enumerate(telemetry_df.groupby('LapNumber')):
+                        plot_tel = _decimate(lap_tel)
                         fig.add_trace(go.Scattergl(
-                            x=first_tel['X'], y=first_tel['Y'], mode='lines',
+                            x=plot_tel['X'], y=plot_tel['Y'], mode='lines',
                             line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                            name=f'{d} Trajectory', legendgroup=f'driver_{d}',
-                            customdata=_speed_distance_customdata(first_tel, first_lap),
+                            opacity=alpha_val,
+                            name=f'{d} Trajectory' if i == 0 else None,
+                            legendgroup=f'driver_{d}', showlegend=(i == 0),
+                            customdata=_speed_distance_customdata(plot_tel, lap_number),
                             hovertemplate=_driver_hover_template(d),
                         ))
-
                         if show_braking_points:
-                            bx, by = _braking_points(first_lap_tel)
-                            brake_trace_idx[d] = len(fig.data)
-                            fig.add_trace(go.Scattergl(
-                                x=bx, y=by, mode='markers',
-                                marker=dict(symbol='triangle-down', size=9, color=driver_colors[d],
-                                            line=dict(color='white', width=1)),
-                                name=f'{d} braking points', legendgroup=f'driver_{d}', hoverinfo='skip',
-                            ))
-
-                        if envelope['valid']:
-                            v = violations_by_driver[d]
-                            v_first = v[v['LapNumber'] == first_lap] if not v.empty else v
-                            violation_trace_idx[d] = len(fig.data)
-                            is_first_violation_trace = len(violation_trace_idx) == 1
-                            fig.add_trace(go.Scattergl(
-                                x=v_first['X'], y=v_first['Y'], mode='markers',
-                                marker=dict(size=5, color=VIOLATION_COLOR, symbol='circle'),
-                                name='Wide of corridor' if is_first_violation_trace else None,
-                                legendgroup='violations', showlegend=is_first_violation_trace,
-                                customdata=(np.stack([v_first['LapNumber'], v_first['Excess']], axis=-1)
-                                            if not v_first.empty else np.empty((0, 2))),
-                                hovertemplate=(f'{d} Lap %{{customdata[0]}}<br>+%{{customdata[1]:.1f}} '
-                                               'm wide<extra></extra>'),
-                            ))
-
-                    frames = []
-                    for lap_number in all_lap_numbers:
-                        frame_data, frame_traces = [], []
-                        for d, lap_numbers in plot_lap_numbers_map.items():
-                            has_lap = lap_number in lap_numbers
-                            lap_tel = (telemetry_map[d][telemetry_map[d]['LapNumber'] == lap_number]
-                                       if has_lap else telemetry_map[d].iloc[0:0])
-
-                            frame_traces.append(line_trace_idx[d])
-                            if has_lap:
-                                plot_tel = _decimate(lap_tel)
-                                frame_data.append(go.Scattergl(
-                                    x=plot_tel['X'], y=plot_tel['Y'],
-                                    customdata=_speed_distance_customdata(plot_tel, lap_number),
-                                ))
-                            else:
-                                frame_data.append(go.Scattergl(x=[], y=[], customdata=np.empty((0, 3))))
-
-                            if show_braking_points:
-                                frame_traces.append(brake_trace_idx[d])
-                                bx, by = _braking_points(lap_tel) if has_lap else (np.array([]), np.array([]))
-                                frame_data.append(go.Scattergl(x=bx, y=by))
-
-                            if envelope['valid']:
-                                frame_traces.append(violation_trace_idx[d])
-                                v = violations_by_driver[d]
-                                v_lap = v[v['LapNumber'] == lap_number] if (has_lap and not v.empty) else v.iloc[0:0]
-                                frame_data.append(go.Scattergl(
-                                    x=v_lap['X'], y=v_lap['Y'],
-                                    customdata=(np.stack([v_lap['LapNumber'], v_lap['Excess']], axis=-1)
-                                                if not v_lap.empty else np.empty((0, 2))),
-                                ))
-                        frames.append(go.Frame(name=str(lap_number), data=frame_data, traces=frame_traces))
-                    fig.frames = frames
-
-                    fig.update_layout(sliders=[dict(
-                        active=0,
-                        currentvalue=dict(prefix='Lap: ', font=dict(color='white')),
-                        pad=dict(t=20), font=dict(color='white'),
-                        steps=[dict(
-                            method='animate',
-                            args=[[str(lap_number)], dict(mode='immediate',
-                                                           frame=dict(duration=0, redraw=True),
-                                                           transition=dict(duration=0))],
-                            label=str(lap_number),
-                        ) for lap_number in all_lap_numbers],
-                    )])
-
-                    if envelope['valid']:
-                        laps_with_violations = {
-                            d: sorted(v['LapNumber'].unique().astype(int).tolist())
-                            for d, v in violations_by_driver.items() if not v.empty
-                        }
-                        if laps_with_violations:
-                            summary = "; ".join(f"{d}: laps {', '.join(map(str, laps))}"
-                                                 for d, laps in laps_with_violations.items())
-                            st.caption(f"Ran wide of the fastest-lap corridor on - {summary} "
-                                       "(scrub to those laps to see exactly where).")
-                        else:
-                            st.caption("All selected drivers stayed within the fastest-lap corridor "
-                                       "across every loaded lap.")
-                    else:
-                        st.caption("Track-limit violations unavailable - no corridor data this session.")
-
+                            bx, by = _braking_points(lap_tel)
+                            braking_points_by_driver[d][0].extend(bx)
+                            braking_points_by_driver[d][1].extend(by)
             else:
-                # --- MAIN RACING LINE(S) ---
-                if color_by_speed and len(telemetry_map) == 1:
-                    # Single driver/lap only (enforced by the checkbox's own visibility
-                    # condition above): a speed heatmap in place of the normal driver-
-                    # colored line - braking zones read cold, straights hot.
-                    d = next(iter(telemetry_map))
-                    lap_tel = telemetry_map[d]
-                    plot_tel = _decimate(lap_tel)
-                    fig.add_trace(go.Scattergl(
-                        x=plot_tel['X'], y=plot_tel['Y'], mode='markers',
-                        marker=dict(
-                            size=4, color=plot_tel['Speed'], colorscale='Turbo', showscale=True,
-                            colorbar=dict(title=dict(text='Speed (km/h)', font=dict(color='white')),
-                                          tickfont=dict(color='white'), x=1.02),
-                        ),
-                        name=f'{d} Trajectory (speed)',
-                        customdata=_speed_distance_customdata(plot_tel, plot_tel['LapNumber'].iloc[0]),
-                        hovertemplate=_driver_hover_template(d),
-                    ))
-                    if show_braking_points:
-                        bx, by = _braking_points(lap_tel)
-                        braking_points_by_driver[d] = (list(bx), list(by))
+                # Average Trend mode: one averaged racing line per driver (mean
+                # X/Y/Speed at each distance-along-lap bin, across every quick lap -
+                # see get_average_lap_trend), always colored by average speed
+                # rather than a flat driver color, since this is meant to read as
+                # a single representative "trend" lap, not a per-lap overlay.
+                avg_profiles = {
+                    d: get_average_lap_trend(
+                        selected_year, selected_race, session_dict[selected_session_type], d)
+                    for d in telemetry_map
+                }
+                avg_profiles = {d: p for d, p in avg_profiles.items() if not p.empty}
+                if not avg_profiles:
+                    st.warning("No average trend could be computed for the selected driver(s).")
                 else:
-                    # Average Trend mode: one averaged racing line per driver (mean
-                    # X/Y/Speed at each distance-along-lap bin, across every quick lap -
-                    # see get_average_lap_trend), always colored by average speed
-                    # rather than a flat driver color, since this is meant to read as
-                    # a single representative "trend" lap, not a per-lap overlay.
-                    avg_profiles = {
-                        d: get_average_lap_trend(
-                            selected_year, selected_race, session_dict[selected_session_type], d)
-                        for d in telemetry_map
-                    }
-                    avg_profiles = {d: p for d, p in avg_profiles.items() if not p.empty}
-                    if not avg_profiles:
-                        st.warning("No average trend could be computed for the selected driver(s).")
-                    else:
-                        # Shared cmin/cmax across every driver's trace so the one visible
-                        # colorbar applies consistently to all of them, not just whichever
-                        # trace happens to own it.
-                        all_speeds = np.concatenate([p['Speed'].to_numpy() for p in avg_profiles.values()])
-                        cmin, cmax = float(all_speeds.min()), float(all_speeds.max())
-                        for i, (d, profile) in enumerate(avg_profiles.items()):
-                            fig.add_trace(go.Scattergl(
-                                x=profile['X'], y=profile['Y'], mode='markers',
-                                marker=dict(
-                                    size=6, color=profile['Speed'], colorscale='Turbo',
-                                    cmin=cmin, cmax=cmax, showscale=(i == 0),
-                                    colorbar=dict(title=dict(text='Avg speed (km/h)', font=dict(color='white')),
-                                                  tickfont=dict(color='white'), x=1.02),
-                                ),
-                                name=f'{d} Average Trend',
-                                customdata=np.stack([profile['Speed'], profile['Distance']], axis=-1),
-                                hovertemplate=(f'{d}<br>Avg speed: %{{customdata[0]:.0f}} km/h<br>'
-                                               'Distance: %{customdata[1]:.0f} m<extra></extra>'),
-                            ))
-
-                    # Braking points, if enabled, are still drawn from every raw quick
-                    # lap (not the averaged line) - averaging would blur exactly where
-                    # they actually happen.
-                    if show_braking_points:
-                        for d, telemetry_df in telemetry_map.items():
-                            for _, lap_tel in telemetry_df.groupby('LapNumber'):
-                                bx, by = _braking_points(lap_tel)
-                                braking_points_by_driver[d][0].extend(bx)
-                                braking_points_by_driver[d][1].extend(by)
-
-                # --- BRAKING POINTS (per driver) ---
-                # Where the Brake channel first rises (not every braking sample), i.e. the
-                # point a driver gets on the brakes for each corner.
-                if show_braking_points:
-                    for d, (bx, by) in braking_points_by_driver.items():
-                        if len(bx):
-                            fig.add_trace(go.Scattergl(
-                                x=bx, y=by, mode='markers',
-                                marker=dict(symbol='triangle-down', size=9, color=driver_colors[d],
-                                            line=dict(color='white', width=1)),
-                                name=f'{d} braking points', legendgroup=f'driver_{d}',
-                                hoverinfo='skip',
-                            ))
-
-                # --- TRACK LIMIT VIOLATIONS (per driver) ---
-                # Points where a selected driver ran wider than every other driver's own
-                # fastest lap at that point on track. Unavailable (explicitly, not as a
-                # silent "zero violations") when there's no corridor to compare against.
-                if not envelope['valid']:
-                    st.caption("Track-limit violations unavailable - no corridor data this session.")
-                else:
-                    violation_summaries = []
-                    for d, lap_numbers in plot_lap_numbers_map.items():
-                        violations = get_driver_track_limit_violations(
-                            selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
-                        if violations.empty:
-                            continue
+                    # Shared cmin/cmax across every driver's trace so the one visible
+                    # colorbar applies consistently to all of them, not just whichever
+                    # trace happens to own it.
+                    all_speeds = np.concatenate([p['Speed'].to_numpy() for p in avg_profiles.values()])
+                    cmin, cmax = float(all_speeds.min()), float(all_speeds.max())
+                    for i, (d, profile) in enumerate(avg_profiles.items()):
                         fig.add_trace(go.Scattergl(
-                            x=violations['X'], y=violations['Y'], mode='markers',
-                            marker=dict(size=5, color=VIOLATION_COLOR, symbol='circle'),
-                            name='Wide of corridor' if not violation_summaries else None,
-                            legendgroup='violations', showlegend=(not violation_summaries),
-                            customdata=np.stack([violations['LapNumber'], violations['Excess']], axis=-1),
-                            hovertemplate=f'{d} Lap %{{customdata[0]}}<br>+%{{customdata[1]:.1f}} m wide<extra></extra>',
+                            x=profile['X'], y=profile['Y'], mode='markers',
+                            marker=dict(
+                                size=6, color=profile['Speed'], colorscale='Turbo',
+                                cmin=cmin, cmax=cmax, showscale=(i == 0),
+                                colorbar=dict(title=dict(text='Avg speed (km/h)', font=dict(color='white')),
+                                              tickfont=dict(color='white'), x=1.02),
+                            ),
+                            name=f'{d} Average Trend',
+                            customdata=np.stack([profile['Speed'], profile['Distance']], axis=-1),
+                            hovertemplate=(f'{d}<br>Avg speed: %{{customdata[0]:.0f}} km/h<br>'
+                                           'Distance: %{customdata[1]:.0f} m<extra></extra>'),
                         ))
-                        violation_summaries.append(
-                            f"{d}: {len(violations)} points (max {violations['Excess'].max():.1f} m beyond)")
 
-                    if violation_summaries:
-                        st.caption("Ran wider than the fastest-lap corridor - " + "; ".join(violation_summaries))
-                    else:
-                        st.caption(
-                            "All selected drivers stayed within the fastest-lap corridor for the selected lap(s).")
+                # Braking points, if enabled, are still drawn from every raw quick
+                # lap (not the averaged line) - averaging would blur exactly where
+                # they actually happen.
+                if show_braking_points:
+                    for d, telemetry_df in telemetry_map.items():
+                        for _, lap_tel in telemetry_df.groupby('LapNumber'):
+                            bx, by = _braking_points(lap_tel)
+                            braking_points_by_driver[d][0].extend(bx)
+                            braking_points_by_driver[d][1].extend(by)
+
+            # --- BRAKING POINTS (per driver) ---
+            # Where the Brake channel first rises (not every braking sample), i.e. the
+            # point a driver gets on the brakes for each corner.
+            if show_braking_points:
+                for d, (bx, by) in braking_points_by_driver.items():
+                    if len(bx):
+                        fig.add_trace(go.Scattergl(
+                            x=bx, y=by, mode='markers',
+                            marker=dict(symbol='triangle-down', size=9, color=driver_colors[d],
+                                        line=dict(color='white', width=1)),
+                            name=f'{d} braking points', legendgroup=f'driver_{d}',
+                            hoverinfo='skip',
+                        ))
+
+            # --- TRACK LIMIT VIOLATIONS (per driver) ---
+            # Points where a selected driver ran wider than every other driver's own
+            # fastest lap at that point on track. Unavailable (explicitly, not as a
+            # silent "zero violations") when there's no corridor to compare against.
+            if not envelope['valid']:
+                st.caption("Track-limit violations unavailable - no corridor data this session.")
+            else:
+                violation_summaries = []
+                for d, lap_numbers in plot_lap_numbers_map.items():
+                    violations = get_driver_track_limit_violations(
+                        selected_year, selected_race, session_dict[selected_session_type], d, lap_numbers)
+                    if violations.empty:
+                        continue
+                    fig.add_trace(go.Scattergl(
+                        x=violations['X'], y=violations['Y'], mode='markers',
+                        marker=dict(size=5, color=VIOLATION_COLOR, symbol='circle'),
+                        name='Wide of corridor' if not violation_summaries else None,
+                        legendgroup='violations', showlegend=(not violation_summaries),
+                        customdata=np.stack([violations['LapNumber'], violations['Excess']], axis=-1),
+                        hovertemplate=f'{d} Lap %{{customdata[0]}}<br>+%{{customdata[1]:.1f}} m wide<extra></extra>',
+                    ))
+                    violation_summaries.append(
+                        f"{d}: {len(violations)} points (max {violations['Excess'].max():.1f} m beyond)")
+
+                if violation_summaries:
+                    st.caption("Ran wider than the fastest-lap corridor - " + "; ".join(violation_summaries))
+                else:
+                    st.caption(
+                        "All selected drivers stayed within the fastest-lap corridor for the selected lap(s).")
 
             # --- SECTOR GATES ---
             # Guarded against NaT: a fastest lap occasionally has a missing sector
@@ -1344,76 +1222,22 @@ def render_driver_dashboard(session):
                 subplot_titles=('Throttle (%)', 'Brake'),
             )
 
-            if is_single_lap_scrub:
-                # Same client-side scrub technique as the track map above: one
-                # persistent throttle/brake trace pair per driver, swapped per lap
-                # via a Plotly frame - without this, Single Lap mode now loading
-                # every quick lap up front (for the track map's scrubber) would
-                # otherwise overlay every lap's throttle/brake trace at full
-                # opacity here instead of showing just the current lap.
-                all_lap_numbers = sorted(set(n for nums in plot_lap_numbers_map.values() for n in nums))
-                throttle_idx, brake_idx = {}, {}
-                for d, lap_numbers in plot_lap_numbers_map.items():
-                    first_lap = lap_numbers[0]
-                    first_tel = _decimate(telemetry_map[d][telemetry_map[d]['LapNumber'] == first_lap])
-                    throttle_idx[d] = len(tb_fig.data)
+            for d, telemetry_df in telemetry_map.items():
+                for i, (lap_number, lap_tel) in enumerate(telemetry_df.groupby('LapNumber')):
+                    plot_tel = _decimate(lap_tel)
                     tb_fig.add_trace(go.Scattergl(
-                        x=first_tel['Distance'], y=first_tel['Throttle'], mode='lines',
+                        x=plot_tel['Distance'], y=plot_tel['Throttle'], mode='lines',
                         line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                        name=d, legendgroup=f'driver_{d}',
+                        opacity=alpha_val,
+                        name=d if i == 0 else None,
+                        legendgroup=f'driver_{d}', showlegend=(i == 0),
                     ), row=1, col=1)
-                    brake_idx[d] = len(tb_fig.data)
                     tb_fig.add_trace(go.Scattergl(
-                        x=first_tel['Distance'], y=first_tel['Brake'].astype(float), mode='lines',
+                        x=plot_tel['Distance'], y=plot_tel['Brake'].astype(float), mode='lines',
                         line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                        showlegend=False, legendgroup=f'driver_{d}',
+                        opacity=alpha_val, showlegend=False,
+                        legendgroup=f'driver_{d}',
                     ), row=2, col=1)
-
-                frames = []
-                for lap_number in all_lap_numbers:
-                    frame_data, frame_traces = [], []
-                    for d, lap_numbers in plot_lap_numbers_map.items():
-                        frame_traces.append(throttle_idx[d])
-                        frame_traces.append(brake_idx[d])
-                        if lap_number in lap_numbers:
-                            lap_tel = _decimate(telemetry_map[d][telemetry_map[d]['LapNumber'] == lap_number])
-                            frame_data.append(go.Scattergl(x=lap_tel['Distance'], y=lap_tel['Throttle']))
-                            frame_data.append(go.Scattergl(x=lap_tel['Distance'], y=lap_tel['Brake'].astype(float)))
-                        else:
-                            frame_data.append(go.Scattergl(x=[], y=[]))
-                            frame_data.append(go.Scattergl(x=[], y=[]))
-                    frames.append(go.Frame(name=str(lap_number), data=frame_data, traces=frame_traces))
-                tb_fig.frames = frames
-
-                tb_fig.update_layout(sliders=[dict(
-                    active=0,
-                    currentvalue=dict(prefix='Lap: ', font=dict(color='white')),
-                    pad=dict(t=20), font=dict(color='white'),
-                    steps=[dict(
-                        method='animate',
-                        args=[[str(lap_number)], dict(mode='immediate',
-                                                       frame=dict(duration=0, redraw=True),
-                                                       transition=dict(duration=0))],
-                        label=str(lap_number),
-                    ) for lap_number in all_lap_numbers],
-                )])
-            else:
-                for d, telemetry_df in telemetry_map.items():
-                    for i, (lap_number, lap_tel) in enumerate(telemetry_df.groupby('LapNumber')):
-                        plot_tel = _decimate(lap_tel)
-                        tb_fig.add_trace(go.Scattergl(
-                            x=plot_tel['Distance'], y=plot_tel['Throttle'], mode='lines',
-                            line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                            opacity=alpha_val,
-                            name=d if i == 0 else None,
-                            legendgroup=f'driver_{d}', showlegend=(i == 0),
-                        ), row=1, col=1)
-                        tb_fig.add_trace(go.Scattergl(
-                            x=plot_tel['Distance'], y=plot_tel['Brake'].astype(float), mode='lines',
-                            line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
-                            opacity=alpha_val, showlegend=False,
-                            legendgroup=f'driver_{d}',
-                        ), row=2, col=1)
 
             _style_subplot_figure(tb_fig, height=450)
             _apply_distance_or_corner_xaxis(tb_fig, corner_tick_vals, corner_tick_text, row=2, col=1)
@@ -1556,6 +1380,16 @@ def render_driver_dashboard(session):
                         )
 
                     _style_subplot_figure(tyre_fig, height=500)
+                    # Explicit legend position + wider right margin: with many laps in a
+                    # stint, the per-lap legend list gets tall enough to overlap the
+                    # "Highlight lap" slider along the bottom even though it's nominally
+                    # off to the side - pinning it further right/top and reserving room
+                    # for it keeps the two apart regardless of legend length.
+                    tyre_fig.update_layout(
+                        legend=dict(font=dict(color='white'), bgcolor=BG_COLOR,
+                                     x=1.02, y=1, xanchor='left', yanchor='top'),
+                        margin=dict(l=10, r=170, t=40, b=10),
+                    )
                     _apply_distance_or_corner_xaxis(tyre_fig, corner_tick_vals, corner_tick_text, row=2, col=1)
                     tyre_fig.update_yaxes(title_text='Throttle %', color='white', gridcolor=TRACK_COLOR,
                                            row=1, col=1)

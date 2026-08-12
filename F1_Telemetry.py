@@ -262,26 +262,31 @@ def get_circuit_corners(year, race, session_type):
 @st.cache_data(show_spinner=False, persist="disk")
 def get_single_lap_telemetry(year, race, session_type, driver, lap_number):
     """Full telemetry for exactly one quick lap of one driver - X/Y/Speed/Distance/
-    Throttle/Brake plus that lap's TyreLife - cached individually per lap rather than
-    per requested-laps TUPLE like the old get_driver_lap_telemetry was. This is the
-    shared fetch primitive behind get_driver_lap_telemetry, get_stint_telemetry,
-    get_average_lap_trend, and the track-limit corridor build, so:
+    Throttle/Brake/SessionTime plus that lap's TyreLife - cached individually per lap
+    rather than per requested-laps TUPLE like the old get_driver_lap_telemetry was.
+    This is the shared fetch primitive behind get_driver_lap_telemetry,
+    get_stint_telemetry, get_average_lap_trend, get_delta_time, get_lap_segment_times,
+    and the track-limit corridor build, so:
     - overlapping lap selections (dragging a range, or switching between Single Lap /
       Average Trend / a stint that shares laps already viewed) reuse whatever was
       already fetched instead of re-fetching the whole batch from scratch.
     - the same lap viewed from two different charts shares one fetch instead of each
       chart doing its own redundant lap.get_telemetry() call.
+    SessionTime is kept (not just Distance) so a lap's own elapsed time-since-lap-
+    start can be reconstructed for delta-time/mini-sector math, the same "anchor at
+    the first sample" convention get_reference_lap_telemetry already falls back to.
     """
     session = get_session_data(year, race, session_type)
     driver_laps = session.laps.pick_driver(driver).pick_quicklaps()
     matching = driver_laps[driver_laps['LapNumber'] == lap_number]
     for _, lap in matching.iterlaps():
         tel = _drop_stuck_position_samples(lap.get_telemetry())[
-            ['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake']].copy()
+            ['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake', 'SessionTime']].copy()
         tel['LapNumber'] = lap['LapNumber']
         tel['TyreLife'] = lap['TyreLife']
         return tel
-    return pd.DataFrame(columns=['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake', 'LapNumber', 'TyreLife'])
+    return pd.DataFrame(
+        columns=['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake', 'SessionTime', 'LapNumber', 'TyreLife'])
 
 
 def _fetch_laps(fetch_args):
@@ -304,6 +309,79 @@ def get_driver_lap_telemetry(year, race, session_type, driver, lap_numbers):
     if not frames:
         return pd.DataFrame(columns=['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake', 'LapNumber'])
     return pd.concat(frames, ignore_index=True)[['X', 'Y', 'Speed', 'Distance', 'Throttle', 'Brake', 'LapNumber']]
+
+
+DELTA_BIN_SIZE_M = 5.0
+
+
+def _elapsed_seconds_vs_distance(tel):
+    """A lap's own elapsed time (seconds since ITS first sample) as a function of
+    Distance, sorted by distance - the shared building block for delta-time and
+    mini-sector math. Not zeroed to LapStartTime (get_single_lap_telemetry doesn't
+    fetch that column) - anchoring at the first telemetry sample instead is the same
+    fallback get_reference_lap_telemetry already uses for sf_time, so this stays
+    consistent with the one other place in the file that does this.
+    """
+    if tel.empty:
+        return np.array([]), np.array([])
+    dist = tel['Distance'].to_numpy()
+    elapsed = (tel['SessionTime'] - tel['SessionTime'].iloc[0]).dt.total_seconds().to_numpy()
+    order = np.argsort(dist)
+    return dist[order], elapsed[order]
+
+
+@st.cache_data(show_spinner=False, persist="disk")
+def get_delta_time(year, race, session_type, compare_year, compare_race, compare_session_type,
+                    compare_driver, compare_lap_number, bin_size=DELTA_BIN_SIZE_M):
+    """Time delta (compare lap minus THIS session's own overall-fastest lap) at each
+    point along the lap, interpolated onto a shared distance grid - the same
+    interpolate-per-lap-onto-a-common-grid pattern get_track_limit_envelope and
+    get_average_lap_trend already use, rather than fastf1.utils.delta_time (which is
+    deprecated since fastf1 3.0.0 and whose own docs warn it "is not actually very
+    accurate"). compare_* is independent of year/race/session_type so this same
+    function serves both same-session deltas (get_lap_delta_time below) and the
+    cross-session/year comparison overlay - positive delta = compare lap is behind/
+    slower than this session's fastest lap at that point on track.
+    """
+    ref_tel, _, _, _, _ = get_reference_lap_telemetry(year, race, session_type)
+    ref_dist, ref_elapsed = _elapsed_seconds_vs_distance(ref_tel)
+    compare_tel = get_single_lap_telemetry(
+        compare_year, compare_race, compare_session_type, compare_driver, compare_lap_number)
+    compare_dist, compare_elapsed = _elapsed_seconds_vs_distance(compare_tel)
+
+    if len(ref_dist) < 2 or len(compare_dist) < 2:
+        return pd.DataFrame(columns=['Distance', 'Delta'])
+
+    max_dist = min(ref_dist.max(), compare_dist.max())
+    bins = np.arange(0, max_dist, bin_size)
+    ref_interp = np.interp(bins, ref_dist, ref_elapsed)
+    compare_interp = np.interp(bins, compare_dist, compare_elapsed)
+    return pd.DataFrame({'Distance': bins, 'Delta': compare_interp - ref_interp})
+
+
+def get_lap_delta_time(year, race, session_type, driver, lap_number):
+    return get_delta_time(year, race, session_type, year, race, session_type, driver, lap_number)
+
+
+@st.cache_data(show_spinner=False, persist="disk")
+def get_lap_segment_times(year, race, session_type, driver, lap_number, segment_length_m):
+    """Time taken to cross each fixed-length distance segment of one lap - boundary
+    times found the same way as get_delta_time (interpolate elapsed-time-vs-Distance),
+    then differenced, so a segment's time is exact even though raw telemetry samples
+    rarely land exactly on a segment boundary. Returns (segment_times, boundaries) -
+    boundaries has one more entry than segment_times (each segment's start/end).
+    """
+    tel = get_single_lap_telemetry(year, race, session_type, driver, lap_number)
+    dist, elapsed = _elapsed_seconds_vs_distance(tel)
+    if len(dist) < 2:
+        return np.array([]), np.array([])
+
+    total_dist = dist.max()
+    boundaries = np.arange(0, total_dist, segment_length_m)
+    if boundaries[-1] < total_dist:
+        boundaries = np.append(boundaries, total_dist)
+    boundary_times = np.interp(boundaries, dist, elapsed)
+    return np.diff(boundary_times), boundaries
 
 
 AVERAGE_TREND_BIN_SIZE_M = 10.0
@@ -827,6 +905,51 @@ def render_driver_dashboard(session):
             help="Marks where each driver first gets on the brakes for each corner "
                  "(the Brake channel's rising edge), not every braking sample.")
 
+    # --- CROSS-SESSION/YEAR COMPARISON --- optional overlay of one driver's fastest
+    # lap from a DIFFERENT year and/or session at the SAME Grand Prix (race is never
+    # a separate selector here - that's what enforces "same circuit"), onto the track
+    # map and delta-time chart below. Restricted to the same event rather than any
+    # circuit because the overlay/delta math is Distance-axis-aligned, which is only
+    # physically meaningful when both laps cover the same physical path - a different
+    # track's Distance channel measures a completely different circuit.
+    compare_tel, compare_label, compare_meta = None, None, None
+    with st.expander("Compare vs. another year/session (same Grand Prix)", expanded=False):
+        compare_enabled = st.checkbox("Enable comparison", value=False, key="cmp_enabled")
+        if compare_enabled:
+            col_cmp1, col_cmp2, col_cmp3 = st.columns(3)
+            with col_cmp1:
+                compare_year = st.selectbox("Year", available_years, key="cmp_year")
+            with col_cmp2:
+                compare_session_label = st.selectbox(
+                    "Session", list(session_dict.keys()), index=0, key="cmp_session")
+                compare_session_type = session_dict[compare_session_label]
+            try:
+                compare_session = get_session_data(compare_year, selected_race, compare_session_type)
+                compare_driver_names = [compare_session.get_driver(d)['Abbreviation']
+                                         for d in compare_session.drivers]
+                with col_cmp3:
+                    compare_driver = st.selectbox("Driver", compare_driver_names, key="cmp_driver")
+                compare_lap = compare_session.laps.pick_driver(compare_driver).pick_quicklaps().pick_fastest()
+                compare_lap_number = int(compare_lap['LapNumber'])
+                compare_tel = get_single_lap_telemetry(
+                    compare_year, selected_race, compare_session_type, compare_driver, compare_lap_number)
+                if compare_tel.empty:
+                    st.warning(f"No telemetry available for {compare_driver}'s fastest lap in "
+                               f"{selected_race} {compare_year} ({compare_session_label}).")
+                    compare_tel = None
+                else:
+                    compare_label = f"{compare_driver} {compare_year} {compare_session_label} (comparison)"
+                    compare_meta = (compare_year, selected_race, compare_session_type,
+                                     compare_driver, compare_lap_number)
+                    st.caption(
+                        f"Comparing against {compare_driver}'s fastest lap (Lap {compare_lap_number}) "
+                        f"from {selected_race} {compare_year} ({compare_session_label}). Track outline "
+                        f"position may drift slightly year-to-year (FastF1's own GPS reference), so "
+                        f"small offsets on the map aren't necessarily a real line difference.")
+            except Exception as e:
+                st.warning(f"Couldn't load comparison session: {e}")
+                compare_tel, compare_label, compare_meta = None, None, None
+
     # Filter out slow laps (in/out laps, safety cars) so they don't ruin the visualization.
     # Fetched per-driver, so re-selecting a driver already viewed this session reuses
     # Streamlit's cache instead of re-querying FastF1.
@@ -968,8 +1091,12 @@ def render_driver_dashboard(session):
             st.warning(f"Error loading data for {', '.join(laps_to_plot_map.keys())}: {e}")
             st.stop()
 
-        # --- TRACK MAP --- its own try/except so a failure here (e.g. a bad corner
-        # entry) can't take down the throttle/brake or tyre panels below, and vice versa.
+        # ================================================================
+        # PLOT 1/5 - TRACK MAP
+        # Racing line(s), track-limit corridor, corner numbers, sector gates.
+        # Own try/except so a failure here (e.g. a bad corner entry) can't
+        # take down the throttle/brake or tyre panels below, and vice versa.
+        # ================================================================
         try:
             fig = go.Figure()
 
@@ -1139,6 +1266,20 @@ def render_driver_dashboard(session):
                     st.caption(
                         "All selected drivers stayed within the fastest-lap corridor for the selected lap(s).")
 
+            # --- CROSS-SESSION COMPARISON OVERLAY ---
+            # The other year/session's fastest lap, from the "Compare vs. another
+            # year/session" expander above. Distinct white dashed style so it never
+            # collides with a driver's own color.
+            if compare_tel is not None:
+                fig.add_trace(go.Scattergl(
+                    x=compare_tel['X'], y=compare_tel['Y'], mode='lines',
+                    line=dict(color='#FFFFFF', width=2, dash='dash'),
+                    name=compare_label,
+                    customdata=_speed_distance_customdata(
+                        compare_tel, compare_tel['LapNumber'].iloc[0]),
+                    hovertemplate=_driver_hover_template(compare_label),
+                ))
+
             # --- SECTOR GATES ---
             # Guarded against NaT: a fastest lap occasionally has a missing sector
             # timestamp (a real FastF1 data gap), which previously crashed sector-gate
@@ -1208,13 +1349,16 @@ def render_driver_dashboard(session):
         except Exception as e:
             st.warning(f"Error plotting the track map: {e}")
 
-        # --- THROTTLE & BRAKE --- own try/except: a failure here shouldn't take down
-        # the track map above or the tyre panel below.
-        # Same driver/lap selection as the track map above, plotted against Distance.
-        # Colored by driver (matching the track map) rather than a fixed throttle/
-        # brake color scheme, since with multiple drivers selected the important
-        # distinction is who's who, not which channel is which - that's already
-        # clear from the subplot titles.
+        # ================================================================
+        # PLOT 2/5 - THROTTLE & BRAKE
+        # Same driver/lap selection as the track map above, plotted against
+        # Distance. Colored by driver (matching the track map) rather than a
+        # fixed throttle/brake color scheme, since with multiple drivers
+        # selected the important distinction is who's who, not which channel
+        # is which - that's already clear from the subplot titles.
+        # Own try/except: a failure here shouldn't take down the track map
+        # above or the tyre panel below.
+        # ================================================================
         try:
             st.markdown("### Throttle & Brake")
             tb_fig = make_subplots(
@@ -1247,14 +1391,17 @@ def render_driver_dashboard(session):
         except Exception as e:
             st.warning(f"Error plotting throttle/brake: {e}")
 
-        # --- TYRE DEGRADATION VS THROTTLE/BRAKE --- own try/except so a failure here
-        # can't take down the charts above.
-        # Independent of the lap selection above: pick a whole stint so brake/throttle
-        # points can be compared across the tyre's full life, colored from fresh
-        # (light) to worn (dark red) by TyreLife. Scoped to one driver at a time -
-        # different drivers have different stints/compounds/lap numbers, so "tyre
-        # degradation" doesn't have a single shared meaning across several drivers
-        # the way the racing line and throttle/brake comparisons above do.
+        # ================================================================
+        # PLOT 3/5 - TYRE DEGRADATION VS THROTTLE/BRAKE
+        # Independent of the lap selection above: pick a whole stint so
+        # brake/throttle points can be compared across the tyre's full life,
+        # colored from fresh (light) to worn (dark red) by TyreLife. Scoped
+        # to one driver at a time - different drivers have different
+        # stints/compounds/lap numbers, so "tyre degradation" doesn't have a
+        # single shared meaning across several drivers the way the racing
+        # line and throttle/brake comparisons above do.
+        # Own try/except so a failure here can't take down the charts above.
+        # ================================================================
         try:
             st.markdown("### Tyre Degradation vs Throttle/Brake")
             tyre_candidates = list(telemetry_map.keys())
@@ -1405,6 +1552,139 @@ def render_driver_dashboard(session):
         except Exception as e:
             st.warning(f"Error plotting tyre degradation: {e}")
 
+        # ================================================================
+        # PLOT 4/5 - DELTA TIME
+        # Time gained/lost vs THIS session's own overall-fastest lap (the same
+        # reference used for the track-limit corridor and sector gates above),
+        # along Distance - computed in-house (get_lap_delta_time/get_delta_time),
+        # not via fastf1.utils.delta_time (deprecated, and its own docs warn it's
+        # "not actually very accurate"). Own try/except so a failure here can't
+        # take down the panels above.
+        # ================================================================
+        try:
+            st.markdown("### Delta Time vs Fastest Lap")
+            delta_fig = go.Figure()
+            delta_fig.add_hline(
+                y=0, line=dict(color='#888888', width=1, dash='dash'),
+                annotation_text='Session fastest lap', annotation_font_color='white')
+
+            for d, lap_numbers in plot_lap_numbers_map.items():
+                for i, lap_number in enumerate(lap_numbers):
+                    delta_df = get_lap_delta_time(
+                        selected_year, selected_race, session_dict[selected_session_type], d, lap_number)
+                    if delta_df.empty:
+                        continue
+                    delta_fig.add_trace(go.Scattergl(
+                        x=delta_df['Distance'], y=delta_df['Delta'], mode='lines',
+                        line=dict(color=driver_colors[d], width=line_width, dash=driver_dash[d]),
+                        opacity=alpha_val,
+                        name=f'{d} Delta' if i == 0 else None,
+                        legendgroup=f'driver_{d}', showlegend=(i == 0),
+                        hovertemplate=(f'{d} Lap {lap_number}<br>'
+                                       'Δ %{y:+.3f}s<br>Distance: %{x:.0f} m<extra></extra>'),
+                    ))
+
+            if compare_meta is not None:
+                compare_delta_df = get_delta_time(
+                    selected_year, selected_race, session_dict[selected_session_type], *compare_meta)
+                if not compare_delta_df.empty:
+                    delta_fig.add_trace(go.Scattergl(
+                        x=compare_delta_df['Distance'], y=compare_delta_df['Delta'], mode='lines',
+                        line=dict(color='#FFFFFF', width=2.5, dash='dash'),
+                        name=compare_label,
+                        hovertemplate=(f'{compare_label}<br>'
+                                       'Δ %{y:+.3f}s<br>Distance: %{x:.0f} m<extra></extra>'),
+                    ))
+
+            _style_subplot_figure(delta_fig, height=350)
+            _apply_distance_or_corner_xaxis(delta_fig, corner_tick_vals, corner_tick_text, row=None, col=None)
+            delta_fig.update_yaxes(title_text='Δ Time vs fastest lap (s)', color='white',
+                                    gridcolor=TRACK_COLOR)
+            st.plotly_chart(delta_fig, use_container_width=True)
+            st.caption(
+                "Positive = behind (slower) at that point on track, negative = ahead (faster), both "
+                "relative to this session's overall fastest lap. Computed by interpolating each lap's "
+                "own elapsed time against Distance, not from official sector-time splits - treat it as "
+                "indicative, not exact."
+            )
+        except Exception as e:
+            st.warning(f"Error plotting delta time: {e}")
+
+        # ================================================================
+        # TABLE - MINI-SECTOR BREAKDOWN
+        # Time taken per fixed-length track segment for each driver's currently
+        # selected lap - a scannable complement to the Delta-Time chart above.
+        # Single Lap view only: Average Trend has no single lap's Time channel to
+        # segment this way (own try/except, same isolation as every panel above).
+        # ================================================================
+        try:
+            st.markdown("### Mini-Sector Breakdown")
+            if view_mode != "Single Lap":
+                st.caption("Switch to Single Lap view to see a mini-sector breakdown.")
+            else:
+                segment_length = st.slider(
+                    "Mini-sector length (m)", min_value=100, max_value=500, value=250, step=50,
+                    key="minisector_length")
+
+                # Each driver's own lap may measure a slightly different total
+                # Distance, so segment counts/boundaries can differ by a fraction of
+                # a segment - the longest boundary set is used for the row labels,
+                # same tolerance-for-drift the rest of the file already accepts
+                # (e.g. get_track_limit_envelope's per-driver interpolation).
+                segment_rows, boundaries_ref = {}, None
+                for d, lap_numbers in plot_lap_numbers_map.items():
+                    if not lap_numbers:
+                        continue
+                    lap_number = lap_numbers[0]
+                    seg_times, boundaries = get_lap_segment_times(
+                        selected_year, selected_race, session_dict[selected_session_type],
+                        d, lap_number, segment_length)
+                    if len(seg_times) == 0:
+                        continue
+                    segment_rows[f'{d} (Lap {lap_number})'] = seg_times
+                    if boundaries_ref is None or len(boundaries) > len(boundaries_ref):
+                        boundaries_ref = boundaries
+
+                if not segment_rows:
+                    st.caption("No segment data available for the selected driver(s)/lap.")
+                else:
+                    n_segments = max(len(v) for v in segment_rows.values())
+                    labels = [f"{int(boundaries_ref[i])}-{int(boundaries_ref[i + 1])} m"
+                              for i in range(min(n_segments, len(boundaries_ref) - 1))]
+                    labels += ['-'] * (n_segments - len(labels))
+
+                    table = pd.DataFrame(
+                        {name: pd.Series(times) for name, times in segment_rows.items()},
+                        index=range(n_segments))
+                    table.insert(0, 'Segment', labels)
+                    driver_cols = [c for c in table.columns if c != 'Segment']
+                    totals = table[driver_cols].sum(numeric_only=True)
+                    table = pd.concat(
+                        [table, pd.DataFrame([{'Segment': 'Total', **totals.to_dict()}])],
+                        ignore_index=True)
+
+                    def _highlight_fastest(row):
+                        styles = [''] * len(row)
+                        if row['Segment'] == 'Total':
+                            return styles
+                        vals = row[driver_cols].astype(float)
+                        if vals.isna().all():
+                            return styles
+                        styles[row.index.get_loc(vals.idxmin())] = 'background-color: #4B0082; color: white'
+                        return styles
+
+                    st.dataframe(
+                        table.style.apply(_highlight_fastest, axis=1)
+                        .format({c: (lambda v: f"{v:.3f}s" if pd.notna(v) else '-') for c in driver_cols}),
+                        hide_index=True, use_container_width=True,
+                    )
+                    st.caption(
+                        "Purple cell = fastest driver through that mini-sector. 'Total' sums each "
+                        "driver's segments as a rough cross-check against their actual lap time."
+                    )
+        except Exception as e:
+            st.warning(f"Error building mini-sector breakdown: {e}")
+
 
 main_col, side_col = st.columns([3, 2])
 
@@ -1413,8 +1693,14 @@ with main_col:
 
 
 def render_position_changes(session, year, race, session_type_label, session_type_code):
-    # Race/Sprint only: Qualifying doesn't have a persistent running position across
-    # a session the way a race does (it's knockout stages, not a continuous order).
+    # ================================================================
+    # PLOT 5/5 - POSITION CHANGES
+    # Per-lap running position for every driver, starting from their actual
+    # grid slot (post-penalty) rather than qualifying order. Race/Sprint
+    # only - Qualifying doesn't have a persistent running position across a
+    # session the way a race does (it's knockout stages, not a continuous
+    # order).
+    # ================================================================
     if session_type_code not in ('R', 'S'):
         return
 
